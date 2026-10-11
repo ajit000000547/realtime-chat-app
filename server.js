@@ -65,39 +65,69 @@ users.forEach((user) => {
 });
 
 const onlineUsers = new Map();
+const userSocketMap = new Map();
 
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
   socket.on('register_user', (user) => {
-    onlineUsers.set(socket.id, user.id);
+    if (user?.id) {
+      userSocketMap.set(user.id, socket.id);
+      onlineUsers.set(socket.id, user.id);
+    }
     io.emit('online_users', Array.from(new Set([...onlineUsers.values()])));
     socket.emit('registered', { success: true, user });
   });
 
   socket.on('send_message', (payload) => {
     const savedMessage = {
-      id: Date.now().toString(),
+      id: payload.id || `${Date.now()}-${Math.random()}`,
       senderId: payload.senderId,
       senderName: payload.senderName,
       receiverId: payload.receiverId,
       message: payload.message || null,
       image: payload.image || null,
-      timestamp: Date.now(),
+      timestamp: payload.timestamp || Date.now(),
       type: payload.type || 'text'
     };
 
     const key = [payload.senderId, payload.receiverId].sort().join('-');
     const current = messages.get(key) || [];
-    current.push(savedMessage);
-    messages.set(key, current);
+    const alreadyExists = current.some((msg) => msg.id === savedMessage.id);
+    if (!alreadyExists) {
+      current.push(savedMessage);
+      messages.set(key, current);
+    }
 
-    io.emit('receive_message', savedMessage);
-    socket.emit('message_sent', savedMessage);
+    const recipientSocketId = userSocketMap.get(payload.receiverId);
+    const senderSocketId = userSocketMap.get(payload.senderId);
+
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('receive_message', savedMessage);
+    }
+
+    if (senderSocketId) {
+      io.to(senderSocketId).emit('message_sent', savedMessage);
+    }
+  });
+
+  socket.on('typing_notification', (payload) => {
+    const recipientSocketId = userSocketMap.get(payload.receiverId);
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('typing_notification', {
+        senderId: payload.senderId,
+        senderName: payload.senderName,
+        receiverId: payload.receiverId
+      });
+    }
   });
 
   socket.on('disconnect', () => {
-    onlineUsers.delete(socket.id);
+    const userId = onlineUsers.get(socket.id);
+    if (userId) {
+      userSocketMap.delete(userId);
+      onlineUsers.delete(socket.id);
+    }
     io.emit('online_users', Array.from(new Set([...onlineUsers.values()])));
     console.log('Client disconnected:', socket.id);
   });
