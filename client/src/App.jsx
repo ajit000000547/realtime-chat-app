@@ -1,88 +1,54 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 
-const currentUser = {
-  id: 'me',
-  name: 'You',
-  avatar: '😊',
-  status: 'Available',
-  color: '#3b82f6'
-};
-
-const STORAGE_KEY = 'whatsapp-lite-offline-store';
+const STORAGE_KEY = 'chatlite-auth';
 
 function App() {
+  const [authMode, setAuthMode] = useState('login');
+  const [user, setUser] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    return saved ? JSON.parse(saved) : null;
+  });
   const [contacts, setContacts] = useState([]);
-  const [selectedContactId, setSelectedContactId] = useState('alice');
+  const [selectedContactId, setSelectedContactId] = useState('');
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState('');
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [selectedImage, setSelectedImage] = useState(null);
   const [typingUser, setTypingUser] = useState('');
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [socket, setSocket] = useState(null);
   const fileInputRef = useRef(null);
+  const [form, setForm] = useState({ name: '', email: '', password: '' });
+  const [error, setError] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
 
   const selectedContact = useMemo(
-    () => contacts.find((contact) => contact.id === selectedContactId) || contacts[0],
+    () => contacts.find((c) => c.id === selectedContactId) || contacts[0],
     [contacts, selectedContactId]
   );
 
-  useEffect(() => {
-    const fetchUsers = async () => {
-      try {
-        const res = await fetch('/api/users');
-        const data = await res.json();
-        setContacts(data);
-        if (data.length && !selectedContactId) {
-          setSelectedContactId(data[0].id);
-        }
-      } catch (error) {
-        console.error('Error fetching contacts', error);
-      }
-    };
+  const filteredContacts = useMemo(
+    () => contacts.filter((c) => c.name.toLowerCase().includes(searchQuery.toLowerCase())),
+    [contacts, searchQuery]
+  );
 
-    fetchUsers();
+  // PWA Installation
+  useEffect(() => {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
   }, []);
 
   useEffect(() => {
-    const newSocket = io({ transports: ['websocket'] });
-    setSocket(newSocket);
-
-    newSocket.emit('register_user', currentUser);
-
-    newSocket.on('receive_message', (msg) => {
-      const receiverKey = msg.receiverId === currentUser.id ? msg.senderId : msg.receiverId;
-      if (receiverKey === selectedContactId || msg.senderId === selectedContactId) {
-        setMessages((prev) => [...prev, msg]);
-      }
-
-      const store = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-      const chatKey = [currentUser.id, selectedContactId].sort().join('-');
-      store[chatKey] = [...(store[chatKey] || []), msg];
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-    });
-
-    newSocket.on('online_users', (users) => {
-      console.log('online users', users);
-    });
-
-    newSocket.on('typing_notification', (data) => {
-      if (data.senderId === selectedContactId) {
-        setTypingUser(data.senderName);
-        setTimeout(() => setTypingUser(''), 800);
-      }
-    });
-
-    return () => newSocket.disconnect();
-  }, [selectedContactId]);
+    if (!user) return;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(user));
+  }, [user]);
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
-
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
@@ -90,71 +56,106 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!selectedContact) return;
+    if (!user) return;
+
+    const newSocket = io('http://localhost:5000', { transports: ['websocket'] });
+    setSocket(newSocket);
+    newSocket.emit('register_user', user);
+
+    newSocket.on('receive_message', (message) => {
+      const isThreadMatch = message.senderId === selectedContactId || message.receiverId === selectedContactId;
+      if (isThreadMatch) {
+        setMessages((prev) => {
+          const exists = prev.some((m) => m.id === message.id);
+          if (exists) return prev;
+          return [...prev, message];
+        });
+      }
+    });
+
+    newSocket.on('typing_notification', (data) => {
+      if (data.senderId === selectedContactId) {
+        setTypingUser(data.senderName);
+        setTimeout(() => setTypingUser(''), 900);
+      }
+    });
+
+    return () => newSocket.disconnect();
+  }, [user, selectedContactId]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const fetchUsers = async () => {
+      try {
+        const response = await fetch('/api/users');
+        const data = await response.json();
+        const filtered = data.filter((person) => person.id !== user.id);
+        setContacts(filtered);
+
+        if (filtered.length && !selectedContactId) {
+          setSelectedContactId(filtered[0].id);
+        }
+      } catch (err) {
+        console.error('Fetch users failed', err);
+      }
+    };
+
+    fetchUsers();
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || !selectedContact) return;
 
     const fetchMessages = async () => {
       try {
-        const res = await fetch(`/api/messages/${currentUser.id}/${selectedContact.id}`);
-        const data = await res.json();
+        const response = await fetch(`/api/messages/${user.id}/${selectedContact.id}`);
+        const data = await response.json();
         setMessages(data);
 
-        const offlineStore = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-        const key = [currentUser.id, selectedContact.id].sort().join('-');
-        const offlineMessages = offlineStore[key] || [];
-
-        if (offlineMessages.length) {
-          setMessages((prev) => [...new Map([...prev, ...offlineMessages].map((m) => [m.id, m])).values()]);
+        const offlineStore = JSON.parse(localStorage.getItem('chatlite-offline') || '{}');
+        const key = [user.id, selectedContact.id].sort().join('-');
+        const cached = offlineStore[key] || [];
+        if (cached.length) {
+          setMessages((prev) => {
+            const merged = [...prev, ...cached];
+            const deduped = [...new Map(merged.map((msg) => [msg.id, msg])).values()];
+            return deduped;
+          });
         }
-      } catch (error) {
-        const offlineStore = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-        const key = [currentUser.id, selectedContact.id].sort().join('-');
+      } catch (err) {
+        const offlineStore = JSON.parse(localStorage.getItem('chatlite-offline') || '{}');
+        const key = [user.id, selectedContact.id].sort().join('-');
         setMessages(offlineStore[key] || []);
       }
     };
 
     fetchMessages();
-  }, [selectedContact]);
+  }, [selectedContact, user]);
 
-  const sendMessage = () => {
-    if (!draft.trim() && !selectedImage) return;
+  const handleAuthSubmit = async (event) => {
+    event.preventDefault();
+    setError('');
 
-    const msg = {
-      id: `${Date.now()}-${Math.random()}`,
-      senderId: currentUser.id,
-      senderName: currentUser.name,
-      receiverId: selectedContact.id,
-      message: draft.trim() || null,
-      image: selectedImage || null,
-      timestamp: Date.now(),
-      type: selectedImage ? 'image' : 'text'
-    };
+    const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/signup';
+    const payload = authMode === 'login'
+      ? { email: form.email, password: form.password }
+      : { name: form.name, email: form.email, password: form.password };
 
-    const key = [currentUser.id, selectedContact.id].sort().join('-');
-    const offlineStore = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-    offlineStore[key] = [...(offlineStore[key] || []), msg];
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(offlineStore));
-
-    if (isOnline && socket) {
-      socket.emit('send_message', msg);
-      setMessages((prev) => [...prev, msg]);
-    } else {
-      setMessages((prev) => [...prev, msg]);
-    }
-
-    setDraft('');
-    setSelectedImage(null);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const handleTyping = (value) => {
-    setDraft(value);
-
-    if (socket && selectedContact) {
-      socket.emit('typing_notification', {
-        senderId: currentUser.id,
-        senderName: currentUser.name,
-        receiverId: selectedContact.id
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
       });
+
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Authentication failed');
+
+      setUser(data.user);
+      setForm({ name: '', email: '', password: '' });
+    } catch (err) {
+      setError(err.message);
     }
   };
 
@@ -167,92 +168,222 @@ function App() {
     reader.readAsDataURL(file);
   };
 
+  const sendMessage = () => {
+    if (!selectedContact) return;
+    if (!draft.trim() && !selectedImage) return;
+
+    const msg = {
+      id: `${Date.now()}-${Math.random()}`,
+      senderId: user.id,
+      senderName: user.name,
+      receiverId: selectedContact.id,
+      message: draft.trim() || null,
+      image: selectedImage || null,
+      timestamp: Date.now(),
+      type: selectedImage ? 'image' : 'text'
+    };
+
+    const offlineStore = JSON.parse(localStorage.getItem('chatlite-offline') || '{}');
+    const key = [user.id, selectedContact.id].sort().join('-');
+    offlineStore[key] = [...(offlineStore[key] || []), msg];
+    localStorage.setItem('chatlite-offline', JSON.stringify(offlineStore));
+
+    setMessages((prev) => [...prev, msg]);
+    if (socket && isOnline) {
+      socket.emit('send_message', msg);
+    }
+
+    if (socket && selectedContact) {
+      socket.emit('typing_notification', {
+        senderId: user.id,
+        senderName: user.name,
+        receiverId: selectedContact.id
+      });
+    }
+
+    setDraft('');
+    setSelectedImage(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem(STORAGE_KEY);
+    setUser(null);
+    setContacts([]);
+    setMessages([]);
+    setSelectedContactId('');
+    setError('');
+  };
+
+  if (!user) {
+    return (
+      <div className="auth-screen">
+        <div className="auth-container">
+          <div className="auth-card">
+            <div className="auth-header">
+              <div className="logo-badge">
+                <svg viewBox="0 0 100 100" className="logo-svg">
+                  <defs>
+                    <linearGradient id="logoGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" style={{ stopColor: '#00b19e', stopOpacity: 1 }} />
+                      <stop offset="100%" style={{ stopColor: '#25d366', stopOpacity: 1 }} />
+                    </linearGradient>
+                  </defs>
+                  <circle cx="50" cy="50" r="48" fill="url(#logoGrad)" />
+                  <path d="M35 55 L45 65 L65 45" stroke="white" strokeWidth="4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </div>
+              <h1>ChatLite Pro</h1>
+              <p>Premium Messaging App</p>
+            </div>
+
+            <div className="mode-tabs">
+              <button className={`tab ${authMode === 'login' ? 'active' : ''}`} onClick={() => setAuthMode('login')}>Login</button>
+              <button className={`tab ${authMode === 'signup' ? 'active' : ''}`} onClick={() => setAuthMode('signup')}>Sign Up</button>
+            </div>
+
+            <form onSubmit={handleAuthSubmit} className="auth-form">
+              {authMode === 'signup' && (
+                <div className="form-group">
+                  <label>Full Name</label>
+                  <input
+                    type="text"
+                    placeholder="Enter your name"
+                    value={form.name}
+                    onChange={(e) => setForm({ ...form, name: e.target.value })}
+                  />
+                </div>
+              )}
+
+              <div className="form-group">
+                <label>Email Address</label>
+                <input
+                  type="email"
+                  placeholder="you@example.com"
+                  value={form.email}
+                  onChange={(e) => setForm({ ...form, email: e.target.value })}
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Password</label>
+                <input
+                  type="password"
+                  placeholder="••••••••"
+                  value={form.password}
+                  onChange={(e) => setForm({ ...form, password: e.target.value })}
+                />
+              </div>
+
+              {error && <div className="error-message">{error}</div>}
+              <button type="submit" className="btn-primary">
+                {authMode === 'login' ? 'Login' : 'Create Account'}
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="app-shell">
+    <div className="app-container">
       <aside className="sidebar">
-        <div className="sidebar-header">
-          <div className="brand-block">
-            <span className="brand-icon">💬</span>
+        <div className="sidebar-top">
+          <div className="sidebar-header">
             <h2>ChatLite</h2>
+            <div className="header-icons">
+              <button className="icon-btn">⚙️</button>
+              <button className="icon-btn" onClick={handleLogout}>🚪</button>
+            </div>
           </div>
-          <span className={`status-pill ${isOnline ? 'online' : 'offline'}`}>
-            {isOnline ? 'Online' : 'Offline'}
-          </span>
+
+          <div className="search-box">
+            <input
+              type="text"
+              placeholder="Search contacts..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+          </div>
         </div>
 
-        <div className="profile-card">
-          <div className="avatar large" style={{ background: currentUser.color }}>{currentUser.avatar}</div>
-          <div>
-            <h3>{currentUser.name}</h3>
-            <small>{currentUser.status}</small>
-          </div>
-        </div>
-
-        <div className="contact-list">
-          {contacts.map((contact) => (
-            <button
+        <div className="contacts-section">
+          {filteredContacts.map((contact) => (
+            <div
               key={contact.id}
-              className={`contact-item ${selectedContactId === contact.id ? 'active' : ''}`}
+              className={`contact-row ${selectedContactId === contact.id ? 'active' : ''}`}
               onClick={() => setSelectedContactId(contact.id)}
             >
-              <div className="avatar" style={{ background: contact.color }}>{contact.avatar}</div>
-              <div className="contact-meta">
-                <div className="row">
-                  <strong>{contact.name}</strong>
-                  <span className={`dot ${contact.status === 'online' ? 'green' : 'gray'}`} />
-                </div>
-                <small>{contact.status}</small>
+              <div className="avatar" style={{ background: contact.color }}>
+                {contact.avatar}
               </div>
-            </button>
+              <div className="contact-info">
+                <div className="contact-name">{contact.name}</div>
+                <div className="contact-status">{contact.status}</div>
+              </div>
+              <span className={`status-dot ${contact.status === 'online' ? 'online' : 'offline'}`}></span>
+            </div>
           ))}
         </div>
       </aside>
 
-      <main className="chat-panel">
+      <main className="chat-main">
         {selectedContact ? (
           <>
-            <header className="chat-header">
-              <div className="chat-user">
-                <div className="avatar" style={{ background: selectedContact.color }}>{selectedContact.avatar}</div>
-                <div>
+            <div className="chat-top">
+              <div className="chat-top-left">
+                <div className="avatar" style={{ background: selectedContact.color }}>
+                  {selectedContact.avatar}
+                </div>
+                <div className="chat-top-info">
                   <h3>{selectedContact.name}</h3>
-                  <small>{typingUser ? `${typingUser} is typing...` : selectedContact.status}</small>
+                  <span>{typingUser ? `${typingUser} is typing...` : selectedContact.status}</span>
                 </div>
               </div>
-              <div className="header-actions">
-                <button>📞</button>
-                <button>📹</button>
-                <button>⋮</button>
+              <div className="chat-actions">
+                <button className="action-btn">📞</button>
+                <button className="action-btn">📹</button>
+                <button className="action-btn">ℹ️</button>
               </div>
-            </header>
-
-            <div className="message-list">
-              {messages.map((msg) => {
-                const isMine = msg.senderId === currentUser.id;
-                return (
-                  <div key={msg.id} className={`message-row ${isMine ? 'mine' : ''}`}>
-                    <div className={`bubble ${isMine ? 'mine' : 'other'}`}>
-                      {msg.type === 'image' && msg.image ? (
-                        <img src={msg.image} alt="shared message" className="sent-image" />
-                      ) : null}
-                      {msg.message ? <p>{msg.message}</p> : null}
-                      <small>{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small>
-                    </div>
-                  </div>
-                );
-              })}
             </div>
 
-            <div className="composer">
+            <div className="messages-area">
+              {messages.length === 0 ? (
+                <div className="empty-chat">
+                  <div className="empty-icon">💬</div>
+                  <p>No messages yet. Start the conversation!</p>
+                </div>
+              ) : (
+                messages.map((msg) => {
+                  const isMine = msg.senderId === user.id;
+                  return (
+                    <div key={msg.id} className={`message ${isMine ? 'sent' : 'received'}`}>
+                      <div className="message-bubble">
+                        {msg.type === 'image' && msg.image ? (
+                          <img src={msg.image} alt="shared" className="message-image" />
+                        ) : null}
+                        {msg.message ? <div className="message-text">{msg.message}</div> : null}
+                        <div className="message-time">
+                          {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="chat-input-area">
               {selectedImage ? (
-                <div className="preview-box">
-                  <img src={selectedImage} alt="selected preview" />
-                  <button onClick={() => setSelectedImage(null)}>Remove</button>
+                <div className="image-preview">
+                  <img src={selectedImage} alt="preview" />
+                  <button className="remove-btn" onClick={() => setSelectedImage(null)}>✕</button>
                 </div>
               ) : null}
 
-              <div className="composer-row">
-                <button className="icon-btn" onClick={() => fileInputRef.current?.click()}>📷</button>
+              <div className="input-row">
+                <button className="input-btn" onClick={() => fileInputRef.current?.click()}>📎</button>
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -262,20 +393,28 @@ function App() {
                 />
 
                 <input
+                  type="text"
+                  className="message-input"
+                  placeholder={isOnline ? 'Type a message...' : 'Offline - message will be saved'}
                   value={draft}
-                  onChange={(e) => handleTyping(e.target.value)}
-                  placeholder={isOnline ? 'Type a message...' : 'You are offline, messages will be saved locally'}
+                  onChange={(e) => setDraft(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') sendMessage();
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      sendMessage();
+                    }
                   }}
                 />
 
-                <button className="send-btn" onClick={sendMessage}>Send</button>
+                <button className="send-btn" onClick={sendMessage}>➤</button>
               </div>
             </div>
           </>
         ) : (
-          <div className="empty-state">Select a contact to start chatting</div>
+          <div className="no-chat">
+            <div className="no-chat-icon">💭</div>
+            <p>Select a contact to start messaging</p>
+          </div>
         )}
       </main>
     </div>
